@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JARVIS: Gesture Draw & Control</title>
+    
+    <!-- MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        :root {
+            --bg-color: #050505;
+            --panel-bg: rgba(20, 20, 20, 0.85);
+            --accent: #00d2ff;
+            --warn: #ffaa00;
+            --text: #ffffff;
+            --font: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        body { margin: 0; overflow: hidden; background-color: var(--bg-color); font-family: var(--font); color: var(--text); user-select: none; }
+        
+        /* Layers */
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        #feedback-canvas { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2; pointer-events: none; }
+
+        /* UI */
+        #ui-layer {
+            position: absolute; top: 10px; right: 10px; width: 340px; z-index: 10;
+            display: flex; flex-direction: column; gap: 10px; pointer-events: none;
+            max-height: 95vh; overflow-y: auto;
+        }
+        .panel {
+            background: var(--panel-bg); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+            border-radius: 12px; padding: 15px; border: 1px solid rgba(255, 255, 255, 0.1); pointer-events: auto;
+        }
+        h1 { font-size: 1.1rem; margin: 0 0 10px 0; color: var(--accent); text-transform: uppercase; letter-spacing: 2px; }
+        
+        /* Controls */
+        .control-group { margin-bottom: 12px; }
+        .control-group label { display: flex; justify-content: space-between; font-size: 0.8rem; color: #ccc; margin-bottom: 4px; }
+        
+        input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 14px; width: 14px; border-radius: 50%; background: var(--accent); cursor: pointer; margin-top: -5px; }
+        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; cursor: pointer; background: rgba(255,255,255,0.2); border-radius: 2px; }
+
+        /* Grid */
+        .template-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+        .template-btn {
+            background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+            color: #eee; padding: 8px; border-radius: 6px; cursor: pointer; font-size: 0.7rem; text-align: center; transition: 0.2s;
+        }
+        .template-btn:hover { background: rgba(255,255,255,0.15); }
+        .template-btn.active { background: var(--accent); color: #000; font-weight: bold; }
+
+        /* Buttons */
+        .btn-action {
+            width: 100%; padding: 10px; background: rgba(255,255,255,0.1); border: none; border-radius: 8px;
+            color: white; cursor: pointer; margin-top: 5px; font-weight: 600; transition: 0.2s;
+        }
+        .btn-action.active { background: var(--warn); color: #000; }
+        .btn-action:hover { opacity: 0.9; }
+
+        /* Draw Mode Overlay */
+        #draw-overlay {
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            background: rgba(0,0,0,0.8); padding: 10px 20px; border-radius: 20px;
+            border: 1px solid var(--accent); color: var(--accent); font-weight: bold;
+            display: none; z-index: 20; pointer-events: none;
+            text-align: center;
+        }
+
+        /* --- CAMERA FEED & SKELETON STYLING --- */
+        #cam-wrapper {
+            display: none; /* Hidden by default */
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            width: 240px;
+            height: 180px;
+            border-radius: 12px;
+            border: 2px solid var(--accent);
+            box-shadow: 0 0 20px rgba(0, 210, 255, 0.2);
+            z-index: 5;
+            overflow: hidden;
+            background: #000;
+            transform: scaleX(-1); /* Mirror the whole wrapper so drawing matches */
+        }
+
+        #video-input, #cam-canvas {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            object-fit: cover;
+        }
+
+        #cam-canvas { z-index: 6; } /* Skeleton on top of video */
+
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; display: inline-block; margin-right: 5px; }
+    </style>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="draw-overlay">
+        ☝️ <b>Index:</b> Draw &nbsp; | &nbsp; 👌 <b>Pinch:</b> Pause<br>
+        Click "Finish" when done.
+    </div>
+    
+    <canvas id="feedback-canvas"></canvas> <!-- 2D Drawing Trail -->
+    <div id="canvas-container"></div> <!-- 3D Scene -->
+    
+    <!-- Camera Wrapper -->
+    <div id="cam-wrapper">
+        <video id="video-input" playsinline></video>
+        <canvas id="cam-canvas"></canvas>
+    </div>
+
+    <div id="ui-layer">
+        <div class="panel">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <h1>JARVIS</h1>
+                <div><span id="cam-status" class="status-dot"></span><small id="mode-text">Mouse</small></div>
+            </div>
+
+            <!-- Shapes -->
+            <div class="control-group">
+                <label>Shape Library</label>
+                <div class="template-grid">
+                    <div class="template-btn active" data-shape="sphere">Sphere</div>
+                    <div class="template-btn" data-shape="cube">Cube</div>
+                    <div class="template-btn" data-shape="heart">Heart</div>
+                    <div class="template-btn" data-shape="helix">Helix</div>
+                    <div class="template-btn" data-shape="spiral">Galaxy</div>
+                    <div class="template-btn" data-shape="buddha">Zen</div>
+                    
+                    <!-- NEW SHAPES -->
+                    <div class="template-btn" data-shape="torus">Donut</div>
+                    <div class="template-btn" data-shape="pyramid">Pyramid</div>
+                    <div class="template-btn" data-shape="star">Star</div>
+                    <div class="template-btn" data-shape="saturn">Saturn</div>
+                </div>
+            </div>
+
+            <!-- Drawing -->
+            <div class="control-group">
+                <button id="btn-draw" class="btn-action">✏️ Draw Custom Shape</button>
+            </div>
+
+            <!-- Sliders -->
+            <div class="control-group">
+                <label><span>Gesture Sensitivity</span> <span id="sens-val">1.0</span></label>
+                <input type="range" id="sensitivity" min="0.1" max="3.0" step="0.1" value="1.0">
+            </div>
+            
+            <div class="control-group">
+                <label><span>Expansion (Breath)</span></label>
+                <input type="range" id="expansion-slider" min="0" max="2" step="0.05" value="1.0">
+            </div>
+
+            <div class="control-group">
+                <label><span>Color</span></label>
+                <!-- Default value set to RGB(13, 23, 22) => Hex #0d1716 -->
+                <input type="color" id="color-picker" value="#0d1716" style="width:100%; height:25px; border:none;">
+            </div>
+
+            <!-- Cam Toggle -->
+            <button id="toggle-cam" class="btn-action">Enable Camera Control</button>
+            
+            <div style="margin-top:10px; font-size:0.75rem; color:#aaa; line-height:1.4;">
+                <b>Controls:</b><br>
+                ✊ <b>Fist + Move:</b> Rotate Scene<br>
+                🖐 <b>Open Hand:</b> Explode<br>
+                ✏️ <b>Draw Mode:</b> Index to draw, Pinch to pause line.
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Config ---
+        const CONFIG = {
+            count: 20000,
+            // R-13 G-23 B-22
+            color: new THREE.Color('rgb(13, 23, 22)'),
+            size: 3.5,
+            noise: 0.5,
+            sensitivity: 1.0,
+            isCamera: false,
+            isDrawing: false,
+            pinchThreshold: 0.08 
+        };
+
+        const STATE = {
+            expansion: 1.0, targetExpansion: 1.0,
+            time: 0,
+            lastHandPos: null,
+            rawPath: [], 
+            opacity: 1.0 
+        };
+
+        // --- Shaders ---
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uExpansion;
+            uniform float uNoise;
+            uniform float uSize;
+            uniform float uGlobalAlpha; 
+            attribute vec3 targetPosition;
+            attribute float sizeOffset;
+            varying float vAlpha;
+
+            // Simple Noise
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2  C = vec2(1.0/6.0, 1.0/3.0); const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy) ); vec3 x0 = v - i + dot(i, C.xxx) ;
+                vec3 g = step(x0.yzx, x0.xyz); vec3 l = 1.0 - g;
+                vec3 i1 = min( g.xyz, l.zxy ); vec3 i2 = max( g.xyz, l.zxy );
+                vec3 x1 = x0 - i1 + C.xxx; vec3 x2 = x0 - i2 + C.yyy; vec3 x3 = x0 - D.yyy;
+                i = mod289(i);
+                vec4 p = permute( permute( permute( i.z + vec4(0.0, i1.z, i2.z, 1.0 )) + i.y + vec4(0.0, i1.y, i2.y, 1.0 )) + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+                float n_ = 0.142857142857; vec3  ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z); vec4 x_ = floor(j * ns.z); vec4 y_ = floor(j - 7.0 * x_ );
+                vec4 x = x_ *ns.x + ns.yyyy; vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4( x.xy, y.xy ); vec4 b1 = vec4( x.zw, y.zw );
+                vec4 s0 = floor(b0)*2.0 + 1.0; vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ; vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+                vec3 p0 = vec3(a0.xy,h.x); vec3 p1 = vec3(a0.zw,h.y); vec3 p2 = vec3(a1.xy,h.z); vec3 p3 = vec3(a1.zw,h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m; return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+            }
+
+            void main() {
+                vec3 pos = position; // Current buffer position
+                vec3 dir = normalize(pos);
+                if (length(pos) < 0.01) dir = vec3(0.0, 1.0, 0.0);
+                
+                // Noise displacement
+                float noiseVal = snoise(pos * 0.5 + uTime * 0.5);
+                vec3 noiseDisp = dir * noiseVal * uNoise;
+                
+                // Expansion Logic
+                vec3 finalPos = pos;
+                if (uExpansion > 1.0) {
+                    finalPos += dir * (uExpansion - 1.0) * 8.0; // Explode out
+                    finalPos += noiseDisp * uExpansion; 
+                } else {
+                    finalPos = mix(vec3(0.0), finalPos, uExpansion); // Contract in
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(finalPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                
+                // Size attenuation
+                gl_PointSize = uSize * (300.0 / -mvPosition.z) * sizeOffset;
+                
+                // Fade logic
+                vAlpha = smoothstep(60.0, 0.0, length(finalPos)) * 0.8 + 0.2;
+                if(uExpansion < 0.2) vAlpha *= uExpansion * 5.0; 
+                vAlpha *= uGlobalAlpha; // Global fade for draw mode
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 uColor;
+            varying float vAlpha;
+            void main() {
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if (dist > 0.5) discard;
+                float strength = pow(1.0 - (dist * 2.0), 2.0);
+                gl_FragColor = vec4(uColor, strength * vAlpha);
+            }
+        `;
+
+        // --- Shapes ---
+        const Shapes = {
+            sphere: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    const r = 10 * Math.cbrt(Math.random());
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    pts.push(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+                }
+                return pts;
+            },
+            cube: (n) => {
+                const pts = [];
+                const s = 14; 
+                for(let i=0; i<n; i++) {
+                    pts.push((Math.random()-0.5)*s, (Math.random()-0.5)*s, (Math.random()-0.5)*s);
+                }
+                return pts;
+            },
+            helix: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    const t = i * 0.01;
+                    const r = 5;
+                    pts.push(r * Math.cos(t * 5), (i/n)*20 - 10, r * Math.sin(t * 5));
+                }
+                return pts;
+            },
+            spiral: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    const t = i * 0.02; // Tightness
+                    const r = t * 0.1; 
+                    pts.push(r * Math.cos(t), (Math.random()-0.5)*2, r * Math.sin(t));
+                }
+                return pts;
+            },
+            heart: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    let t = Math.random() * Math.PI * 2;
+                    let r = Math.random(); 
+                    let x = 16 * Math.pow(Math.sin(t), 3);
+                    let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                    let scale = 0.5 * Math.sqrt(r);
+                    pts.push(x * scale, y * scale, (Math.random()-0.5)*5);
+                }
+                return pts;
+            },
+            buddha: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    const p = Math.random();
+                    let x,y,z;
+                    if(p < 0.25) { // Head
+                         const r = 2.5 * Math.cbrt(Math.random());
+                         const theta = Math.random() * Math.PI * 2; const phi = Math.acos(2 * Math.random() - 1);
+                         x=r*Math.sin(phi)*Math.cos(theta); y=r*Math.sin(phi)*Math.sin(theta)+6; z=r*Math.cos(phi);
+                    } else if (p < 0.7) { // Body
+                        const h = Math.random()*8; const r = Math.sqrt(Math.random()) * 4.5 * (1-h/10);
+                        const t = Math.random()*Math.PI*2;
+                        x=r*Math.cos(t); y=h-2; z=r*Math.sin(t)*0.8;
+                    } else { // Legs
+                        const t=Math.random()*Math.PI*2; const rad=5+Math.random()*2;
+                        x=rad*Math.cos(t); y=-3+Math.random()*2; z=rad*Math.sin(t);
+                    }
+                    pts.push(x,y,z);
+                }
+                return pts;
+            },
+            // --- NEW SHAPES ---
+            torus: (n) => {
+                const pts = [];
+                const R = 7; // Major radius
+                const r = 3; // Minor radius
+                for(let i=0; i<n; i++) {
+                    const u = Math.random() * Math.PI * 2;
+                    const v = Math.random() * Math.PI * 2;
+                    // Torus formula
+                    const x = (R + r * Math.cos(v)) * Math.cos(u);
+                    const y = (R + r * Math.cos(v)) * Math.sin(u);
+                    const z = r * Math.sin(v);
+                    pts.push(x, y, z);
+                }
+                return pts;
+            },
+            pyramid: (n) => {
+                const pts = [];
+                const h = 12;
+                const b = 12;
+                for(let i=0; i<n; i++) {
+                    // Random point in pyramid
+                    const y = (Math.random() - 0.5) * h; // Height
+                    const level = (0.5 - y/h); // 0 at top, 1 at bottom
+                    const range = b * level;
+                    const x = (Math.random() - 0.5) * range;
+                    const z = (Math.random() - 0.5) * range;
+                    pts.push(x, y, z);
+                }
+                return pts;
+            },
+            star: (n) => {
+                const pts = [];
+                for(let i=0; i<n; i++) {
+                    const t = Math.random() * Math.PI * 2;
+                    const p = Math.acos(2 * Math.random() - 1);
+                    const r = 8 + 4 * Math.sin(5*t) * Math.sin(5*p);
+                    pts.push(r * Math.sin(p) * Math.cos(t), r * Math.sin(p) * Math.sin(t), r * Math.cos(p));
+                }
+                return pts;
+            },
+            saturn: (n) => {
+                const pts = [];
+                // Split points: 40% Planet, 60% Rings
+                const planetCount = Math.floor(n * 0.4);
+                const ringCount = n - planetCount;
+                
+                // 1. Planet (Solid Sphere)
+                for(let i=0; i<planetCount; i++) {
+                    // Radius ~ 4.5
+                    const r = 4.5 * Math.cbrt(Math.random()); 
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    pts.push(
+                        r * Math.sin(phi) * Math.cos(theta),
+                        r * Math.sin(phi) * Math.sin(theta), 
+                        r * Math.cos(phi)
+                    );
+                }
+
+                // 2. Rings (Annulus)
+                // Tilt angle
+                const tilt = 0.4; // Radians
+                const cosT = Math.cos(tilt);
+                const sinT = Math.sin(tilt);
+
+                for(let i=0; i<ringCount; i++) {
+                    const t = Math.random() * Math.PI * 2;
+                    // Radius between 6.5 and 11
+                    const rad = 6.5 + Math.random() * 5.0; 
+                    
+                    // Flat ring on XZ plane
+                    let x = rad * Math.cos(t);
+                    let z = rad * Math.sin(t);
+                    let y = (Math.random()-0.5) * 0.2; // Tiny thickness
+
+                    // Apply Tilt Rotation (rotate around Z axis slightly or X axis)
+                    // Let's rotate around X axis
+                    let y_new = y * cosT - z * sinT;
+                    let z_new = y * sinT + z * cosT;
+                    
+                    pts.push(x, y_new, z_new);
+                }
+                return pts;
+            }
+        };
+
+        // --- App Class ---
+        class App {
+            constructor() {
+                this.initThree();
+                this.initParticles();
+                this.initUI();
+                this.init2DCanvas();
+                
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix()  
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                    this.feedbackCanvas.width = window.innerWidth;
+                    this.feedbackCanvas.height = window.innerHeight;
+                });
+                
+                this.animate();
+            }
+
+            initThree() {
+                this.scene = new THREE.Scene();
+                this.scene.fog = new THREE.FogExp2(0x050505, 0.02);
+                
+                this.camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+                this.camera.position.z = 35;
+                
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                document.getElementById('canvas-container').appendChild(this.renderer.domElement);
+
+                this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+                this.controls.enableDamping = true;
+                this.controls.autoRotate = true;
+                this.controls.autoRotateSpeed = 1.0;
+            }
+
+            initParticles() {
+                this.geometry = new THREE.BufferGeometry();
+                const positions = new Float32Array(Shapes.sphere(CONFIG.count));
+                const targets = new Float32Array(positions);
+                const sizes = new Float32Array(CONFIG.count);
+                for(let i=0; i<CONFIG.count; i++) sizes[i] = 0.5 + Math.random();
+
+                this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                this.geometry.setAttribute('targetPosition', new THREE.BufferAttribute(targets, 3));
+                this.geometry.setAttribute('sizeOffset', new THREE.BufferAttribute(sizes, 1));
+
+                this.material = new THREE.ShaderMaterial({
+                    uniforms: {
+                        uTime: { value: 0 },
+                        uColor: { value: CONFIG.color },
+                        uExpansion: { value: 1.0 },
+                        uNoise: { value: CONFIG.noise },
+                        uSize: { value: CONFIG.size },
+                        uGlobalAlpha: { value: 1.0 }
+                    },
+                    vertexShader, fragmentShader,
+                    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+                });
+
+                this.points = new THREE.Points(this.geometry, this.material);
+                this.scene.add(this.points);
+                this.particleGroup = new THREE.Group();
+                this.particleGroup.add(this.points);
+                this.scene.add(this.particleGroup);
+            }
+
+            init2DCanvas() {
+                // Main drawing trail canvas
+                this.feedbackCanvas = document.getElementById('feedback-canvas');
+                this.feedbackCanvas.width = window.innerWidth;
+                this.feedbackCanvas.height = window.innerHeight;
+                this.ctx2D = this.feedbackCanvas.getContext('2d');
+
+                // Camera overlay canvas (for skeleton)
+                this.camCanvas = document.getElementById('cam-canvas');
+                this.camCanvas.width = 240;
+                this.camCanvas.height = 180;
+                this.camCtx = this.camCanvas.getContext('2d');
+            }
+
+            morphTo(shapeData) {
+                let newPos;
+                if (typeof shapeData === 'string') {
+                    newPos = Shapes[shapeData](CONFIG.count);
+                } else {
+                    newPos = shapeData; 
+                }
+                this.geometry.userData.targetPositions = newPos;
+            }
+
+            initUI() {
+                // Shapes
+                document.querySelectorAll('.template-btn').forEach(btn => {
+                    btn.addEventListener('click', (e) => {
+                        document.querySelectorAll('.template-btn').forEach(b => b.classList.remove('active'));
+                        e.target.classList.add('active');
+                        this.morphTo(e.target.dataset.shape);
+                        STATE.opacity = 1.0; // Show particles if they were hidden
+                    });
+                });
+
+                // Sensitivity
+                document.getElementById('sensitivity').addEventListener('input', (e) => {
+                    CONFIG.sensitivity = parseFloat(e.target.value);
+                    document.getElementById('sens-val').innerText = CONFIG.sensitivity;
+                });
+
+                // Color
+                document.getElementById('color-picker').addEventListener('input', (e) => {
+                    CONFIG.color.set(e.target.value);
+                    this.material.uniforms.uColor.value.copy(CONFIG.color);
+                });
+
+                // Expansion
+                const expSlider = document.getElementById('expansion-slider');
+                expSlider.addEventListener('input', (e) => {
+                    if(!CONFIG.isCamera) STATE.targetExpansion = parseFloat(e.target.value);
+                });
+
+                // Camera Toggle
+                document.getElementById('toggle-cam').addEventListener('click', () => {
+                    if (!CONFIG.isCamera) this.startCamera(); else this.stopCamera();
+                });
+
+                // Draw Mode
+                const drawBtn = document.getElementById('btn-draw');
+                drawBtn.addEventListener('click', () => {
+                    this.toggleDrawMode();
+                });
+            }
+
+            toggleDrawMode() {
+                CONFIG.isDrawing = !CONFIG.isDrawing;
+                const drawBtn = document.getElementById('btn-draw');
+
+                if(CONFIG.isDrawing) {
+                    drawBtn.innerText = "✅ Finish Drawing";
+                    drawBtn.classList.add('active');
+                    document.getElementById('draw-overlay').style.display = 'block';
+                    
+                    // --- ERASE / RESET ---
+                    STATE.rawPath = []; // Clear path history
+                    this.ctx2D.clearRect(0,0,this.feedbackCanvas.width, this.feedbackCanvas.height);
+                    STATE.opacity = 0.0; // Hide 3D particles while drawing
+                    
+                    if(!CONFIG.isCamera) {
+                        alert("Enable Camera first to draw with your hand!");
+                        this.startCamera();
+                    }
+                } else {
+                    this.finishDrawing();
+                }
+            }
+
+            finishDrawing() {
+                CONFIG.isDrawing = false;
+                const drawBtn = document.getElementById('btn-draw');
+                drawBtn.innerText = "✏️ Draw Custom Shape";
+                drawBtn.classList.remove('active');
+                document.getElementById('draw-overlay').style.display = 'none';
+                
+                // Clear 2D canvas
+                this.ctx2D.clearRect(0,0,this.feedbackCanvas.width, this.feedbackCanvas.height);
+                
+                // Show particles again
+                STATE.opacity = 1.0;
+                
+                this.processDrawing();
+            }
+
+            processDrawing() {
+                // Filter out nulls (pauses) to create continuous particle buffer
+                const validPoints = STATE.rawPath.filter(p => p !== null);
+
+                if (validPoints.length < 5) {
+                    // If drawing was empty, just show sphere
+                    if(STATE.rawPath.length > 0) alert("Drawing too short! Showing default sphere.");
+                    this.morphTo('sphere');
+                    return;
+                }
+                
+                // Convert normalized raw points to 3D world space
+                const vectorPoints = validPoints.map(p => {
+                    // Map 0..1 to -20..20 world units
+                    const x = (1.0 - p.x) * 40 - 20; 
+                    const y = (1.0 - p.y) * 30 - 15;
+                    return new THREE.Vector3(x, y, 0);
+                });
+
+                const curve = new THREE.CatmullRomCurve3(vectorPoints);
+                const curvePoints = curve.getSpacedPoints(CONFIG.count);
+                
+                const finalArr = [];
+                curvePoints.forEach(p => {
+                    finalArr.push(
+                        p.x + (Math.random()-0.5), 
+                        p.y + (Math.random()-0.5), 
+                        p.z + (Math.random()-0.5)
+                    );
+                });
+                
+                this.morphTo(finalArr);
+            }
+
+            drawRealTimePath() {
+                const w = this.feedbackCanvas.width;
+                const h = this.feedbackCanvas.height;
+                
+                this.ctx2D.clearRect(0,0,w,h);
+                this.ctx2D.lineWidth = 5;
+                this.ctx2D.lineCap = "round";
+                this.ctx2D.shadowBlur = 15;
+                this.ctx2D.shadowColor = "#00d2ff";
+                this.ctx2D.strokeStyle = "#00d2ff";
+
+                this.ctx2D.beginPath();
+                
+                let isDrawingLine = false;
+
+                // Draw segments, handling nulls as breaks
+                for(let i=0; i<STATE.rawPath.length; i++) {
+                    const p = STATE.rawPath[i];
+                    
+                    if (p === null) {
+                        isDrawingLine = false; // Lift pen
+                        continue;
+                    }
+
+                    const sx = (1.0 - p.x) * w;
+                    const sy = p.y * h;
+
+                    if (!isDrawingLine) {
+                        this.ctx2D.moveTo(sx, sy);
+                        isDrawingLine = true;
+                    } else {
+                        this.ctx2D.lineTo(sx, sy);
+                    }
+                }
+                this.ctx2D.stroke();
+            }
+
+            async startCamera() {
+                const videoEl = document.getElementById('video-input');
+                const camWrapper = document.getElementById('cam-wrapper');
+                const dot = document.getElementById('cam-status');
+                
+                if (window.location.protocol === 'file:') {
+                    alert("Camera blocked by browser security (file://). Use Localhost.");
+                    return;
+                }
+
+                dot.className = 'status-dot active'; dot.style.background = 'orange';
+                document.getElementById('mode-text').innerText = "Loading...";
+
+                try {
+                    this.hands = new window.Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+                    this.hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+                    this.hands.onResults(this.onHandResults.bind(this));
+
+                    this.cameraObj = new window.Camera(videoEl, {
+                        onFrame: async () => { await this.hands.send({image: videoEl}); },
+                        width: 320, height: 240
+                    });
+
+                    await this.cameraObj.start();
+                    
+                    camWrapper.style.display = "block"; 
+                    
+                    CONFIG.isCamera = true;
+                    dot.style.background = '#0f0';
+                    document.getElementById('mode-text').innerText = "Gesture Active";
+                    document.getElementById('toggle-cam').innerText = "Disable Camera";
+                    this.controls.autoRotate = false; 
+
+                } catch (e) {
+                    console.error(e);
+                    alert("Camera Init Failed: " + e.message);
+                    this.stopCamera();
+                }
+            }
+
+            stopCamera() {
+                const camWrapper = document.getElementById('cam-wrapper');
+                if(this.cameraObj) this.cameraObj.stop();
+                
+                camWrapper.style.display = "none";
+                this.ctx2D.clearRect(0,0,this.feedbackCanvas.width, this.feedbackCanvas.height); 
+
+                CONFIG.isCamera = false;
+                document.getElementById('cam-status').style.background = '#555';
+                document.getElementById('mode-text').innerText = "Mouse Mode";
+                document.getElementById('toggle-cam').innerText = "Enable Camera";
+                STATE.opacity = 1.0;
+            }
+
+            onHandResults(results) {
+                // Clear the small camera overlay
+                this.camCtx.clearRect(0, 0, this.camCanvas.width, this.camCanvas.height);
+
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    // Draw Skeleton on Camera Feed
+                    const lm = results.multiHandLandmarks[0];
+                    window.drawConnectors(this.camCtx, lm, window.HAND_CONNECTIONS, {color: '#00d2ff', lineWidth: 2});
+                    window.drawLandmarks(this.camCtx, lm, {color: '#ffffff', lineWidth: 1, radius: 2});
+
+                    const indexTip = lm[8];
+                    const thumbTip = lm[4];
+                    const wrist = lm[0];
+                    const middleTip = lm[12];
+
+                    // --- 1. Draw Mode Logic ---
+                    if (CONFIG.isDrawing) {
+                        
+                        // Check for Pinch (Pause / Lift Pen)
+                        const pinchDist = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
+                        const isPinching = pinchDist < CONFIG.pinchThreshold;
+
+                        if (isPinching) {
+                            // Pen is UP: Insert a break if the last point wasn't already a break
+                            if (STATE.rawPath.length > 0 && STATE.rawPath[STATE.rawPath.length-1] !== null) {
+                                STATE.rawPath.push(null);
+                            }
+                            // Do not add point, but we still update the drawing to show existing lines
+                            this.drawRealTimePath();
+                        } else {
+                            // Pen is DOWN: Draw
+                            STATE.rawPath.push({x: indexTip.x, y: indexTip.y});
+                            this.drawRealTimePath();
+                        }
+                        return; 
+                    }
+
+                    // --- 2. Standard Gesture Detection (Rotate/Explode) ---
+                    const lenFull = Math.hypot(middleTip.x - wrist.x, middleTip.y - wrist.y);
+                    const lenBase = Math.hypot(lm[9].x - wrist.x, lm[9].y - wrist.y);
+                    const isOpen = (lenFull / lenBase) > 1.6;
+                    const isFist = (lenFull / lenBase) < 1.3;
+
+                    const handX = (1.0 - wrist.x) * 2 - 1; 
+                    const handY = (1.0 - wrist.y) * 2 - 1;
+
+                    if (isFist) {
+                        if (STATE.lastHandPos) {
+                            const dx = (handX - STATE.lastHandPos.x) * 5.0 * CONFIG.sensitivity;
+                            const dy = (handY - STATE.lastHandPos.y) * 5.0 * CONFIG.sensitivity;
+                            this.particleGroup.rotation.y += dx;
+                            this.particleGroup.rotation.x -= dy; 
+                        }
+                        STATE.lastHandPos = { x: handX, y: handY };
+                        STATE.targetExpansion = 0.5;
+                    } else if (isOpen) {
+                        STATE.lastHandPos = null;
+                        STATE.targetExpansion = 2.0; 
+                    } else {
+                        STATE.lastHandPos = null;
+                        STATE.targetExpansion = 1.0;
+                    }
+                    document.getElementById('expansion-slider').value = STATE.targetExpansion;
+                } else {
+                    STATE.lastHandPos = null;
+                }
+            }
+
+            animate() {
+                requestAnimationFrame(this.animate.bind(this));
+                STATE.time += 0.016;
+                
+                if(!CONFIG.isCamera) this.controls.update();
+
+                // Smooth expansion
+                STATE.expansion += (STATE.targetExpansion - STATE.expansion) * 0.1;
+
+                // Morph particles to target shape
+                if (this.geometry.userData.targetPositions) {
+                    const pos = this.geometry.attributes.position.array;
+                    const target = this.geometry.userData.targetPositions;
+                    let needsUp = false;
+                    for(let i=0; i<pos.length; i++) {
+                        const diff = target[i] - pos[i];
+                        if(Math.abs(diff) > 0.01) {
+                            pos[i] += diff * 0.08; // Morph speed
+                            needsUp = true;
+                        }
+                    }
+                    if(needsUp) this.geometry.attributes.position.needsUpdate = true;
+                }
+
+                this.material.uniforms.uTime.value = STATE.time;
+                this.material.uniforms.uExpansion.value = STATE.expansion;
+                this.material.uniforms.uColor.value.copy(CONFIG.color);
+                this.material.uniforms.uGlobalAlpha.value = STATE.opacity; // Control visibility
+
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+
+        window.addEventListener('load', () => new App());
+    </script>
+</body>
+</html>
